@@ -32,6 +32,7 @@ export default function GoogleDriveClone() {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(false);
   const [isDeletingFile, setIsDeletingFile] = useState<string | null>(null);
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch user's files on component mount
@@ -90,6 +91,10 @@ export default function GoogleDriveClone() {
       
       // Remove file from state
       setUploadedFiles(prevFiles => prevFiles.filter(file => file.id !== fileId));
+      // If the deleted file was selected, clear the selection
+      if (selectedDocumentId === fileId) {
+        setSelectedDocumentId(null);
+      }
     } catch (error) {
       console.error("Error deleting file:", error);
       alert("Failed to delete file. Please try again.");
@@ -118,6 +123,11 @@ export default function GoogleDriveClone() {
     }
   };
 
+  // Handle file selection for query
+  const handleFileSelect = (fileId: string) => {
+    setSelectedDocumentId(fileId === selectedDocumentId ? null : fileId);
+  };
+
   // Updated function to handle query submission
   const handleQuerySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -130,23 +140,41 @@ export default function GoogleDriveClone() {
     setResponse("");
 
     try {
-      const res = await fetch(process.env.CLOUD_URL || "", {
+      // Get user ID from localStorage or use default
+      const userId = localStorage.getItem("userId") || "default_user";
+      
+      // Prepare request body
+      const requestBody: any = { query, user_uuid: userId };
+      
+      // Find document name if a document is selected
+      if (selectedDocumentId) {
+        const selectedFile = uploadedFiles.find(file => file.id === selectedDocumentId);
+        if (selectedFile) {
+          requestBody.document_name = selectedFile.name;
+        }
+      }
+      
+      // Get the Cloud Run URL from environment variable or use a default
+      const cloudRunUrl = process.env.NEXT_PUBLIC_CLOUD_RUN_URL || "https://mcp-987835613654.us-east1.run.app";
+      
+      const res = await fetch(cloudRunUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          query,
-          documentId: "example-document-id", // Replace with actual document ID logic
-          uuid: "example-uuid", // Replace with actual UUID logic
-        }),
+        body: JSON.stringify(requestBody),
       });
+
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || "Failed to get response from server");
+      }
 
       const data = await res.json();
       setResponse(data.response || "No response received from server.");
     } catch (error) {
-      setResponse("Error: Failed to fetch response from server.");
       console.error("Error:", error);
+      setResponse(`Error: ${error instanceof Error ? error.message : "Failed to fetch response from server."}`);
     } finally {
       setIsLoading(false);
     }
@@ -322,10 +350,13 @@ export default function GoogleDriveClone() {
             {uploadedFiles.map((file) => (
               <div 
                 key={file.id} 
-                className="p-4 border border-gray-700 rounded-lg flex items-center justify-between hover:bg-gray-800"
+                className={`p-4 border border-gray-700 rounded-lg flex items-center justify-between hover:bg-gray-800 ${
+                  selectedDocumentId === file.id ? "bg-gray-700 border-blue-500" : ""
+                }`}
+                onClick={() => handleFileSelect(file.id)}
               >
                 <div className="flex items-center">
-                  <File className="w-6 h-6 text-gray-400 mr-4" aria-label="File" />
+                  <File className={`w-6 h-6 ${selectedDocumentId === file.id ? "text-blue-500" : "text-gray-400"} mr-4`} aria-label="File" />
                   <div className="flex flex-col">
                     <p className="text-sm text-white font-medium">{file.name}</p>
                     <div className="flex items-center text-xs text-gray-400 mt-1">
@@ -337,7 +368,7 @@ export default function GoogleDriveClone() {
                 </div>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button variant="ghost" className="h-8 w-8 p-0">
+                    <Button variant="ghost" className="h-8 w-8 p-0" onClick={(e) => e.stopPropagation()}>
                       {isDeletingFile === file.id ? (
                         <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
                       ) : (
@@ -349,7 +380,10 @@ export default function GoogleDriveClone() {
                   <DropdownMenuContent align="end" className="w-36">
                     <DropdownMenuItem 
                       className="text-red-500 focus:text-red-500 cursor-pointer"
-                      onClick={() => handleDeleteFile(file.id, file.name)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteFile(file.id, file.name);
+                      }}
                       disabled={isDeletingFile === file.id}
                     >
                       <Trash2 className="mr-2 h-4 w-4" />
@@ -365,7 +399,19 @@ export default function GoogleDriveClone() {
 
       {/* Query Section */}
       <div className="mb-6 bg-gray-800 p-4 rounded-lg">
-        <h2 className="text-lg font-semibold text-white mb-2">Query Processor</h2>
+        <h2 className="text-lg font-semibold text-white mb-2">Query Your Documents</h2>
+        {selectedDocumentId ? (
+          <div className="bg-blue-900/30 p-2 rounded-md mb-3 flex items-center">
+            <File className="text-blue-400 w-4 h-4 mr-2" />
+            <span className="text-sm text-blue-200">
+              Querying: {uploadedFiles.find(f => f.id === selectedDocumentId)?.name || "Selected document"}
+            </span>
+          </div>
+        ) : (
+          <div className="bg-gray-700/50 p-2 rounded-md mb-3 text-sm text-gray-300">
+            Click on a file above to query it specifically, or submit a query without selecting to search all your documents.
+          </div>
+        )}
         <form onSubmit={handleQuerySubmit} className="space-y-4">
           <input
             type="text"
@@ -380,7 +426,14 @@ export default function GoogleDriveClone() {
             disabled={isLoading}
             className="bg-blue-600 text-white hover:bg-blue-700"
           >
-            {isLoading ? "Processing..." : "Submit Query"}
+            {isLoading ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Processing...
+              </>
+            ) : (
+              "Submit Query"
+            )}
           </Button>
           <textarea
             value={response}
