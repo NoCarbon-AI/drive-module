@@ -1,9 +1,24 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { mockData, type Item } from "../lib/mock-data"; // Ensure path is correct
-import { Folder, File, ChevronRight, Upload, Loader2 } from "lucide-react";
+import { Folder, File, ChevronRight, Upload, Loader2, MoreVertical, Trash2, RefreshCw } from "lucide-react";
 import { Button } from "../components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "../components/ui/dropdown-menu";
+
+// Define a type for uploaded files
+interface UploadedFile {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  uploadedAt: string;
+}
 
 export default function GoogleDriveClone() {
   const [currentFolder, setCurrentFolder] = useState<Item[]>(mockData);
@@ -14,7 +29,74 @@ export default function GoogleDriveClone() {
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [uploadProgress, setUploadProgress] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+  const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(false);
+  const [isDeletingFile, setIsDeletingFile] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Fetch user's files on component mount
+  useEffect(() => {
+    fetchUserFiles();
+  }, []);
+
+  const fetchUserFiles = async () => {
+    setIsLoadingFiles(true);
+    try {
+      // Get user ID from localStorage or use default
+      const userId = localStorage.getItem("userId") || "default_user";
+      
+      const response = await fetch("/api/files", {
+        method: "GET",
+        headers: {
+          "x-user-id": userId
+        }
+      });
+      
+      if (!response.ok) {
+        throw new Error("Failed to fetch files");
+      }
+      
+      const data = await response.json();
+      setUploadedFiles(data.files || []);
+    } catch (error) {
+      console.error("Error fetching files:", error);
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  };
+
+  const handleDeleteFile = async (fileId: string, fileName: string) => {
+    setIsDeletingFile(fileId);
+    try {
+      // Get user ID from localStorage or use default
+      const userId = localStorage.getItem("userId") || "default_user";
+      
+      const response = await fetch("/api/delete", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          "x-user-id": userId
+        },
+        body: JSON.stringify({ 
+          documentId: fileId,
+          fileName: fileName
+        })
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to delete file");
+      }
+      
+      // Remove file from state
+      setUploadedFiles(prevFiles => prevFiles.filter(file => file.id !== fileId));
+    } catch (error) {
+      console.error("Error deleting file:", error);
+      alert("Failed to delete file. Please try again.");
+    } finally {
+      setIsDeletingFile(null);
+    }
+  };
 
   const handleItemClick = (item: Item) => {
     if (item.type === "folder") {
@@ -120,9 +202,8 @@ export default function GoogleDriveClone() {
         `User ID: ${result.userId}`
       ]);
 
-      // Optional: Refresh the file list or add the new file to the UI
-      // This would depend on your actual implementation
-      console.log("Upload successful:", result);
+      // Refresh file list after successful upload
+      fetchUserFiles();
       
       // Clear the file input
       if (fileInputRef.current) {
@@ -140,11 +221,35 @@ export default function GoogleDriveClone() {
     }
   };
 
+  // Format file size in a readable way
+  const formatFileSize = (sizeInBytes: number): string => {
+    if (sizeInBytes < 1024) return `${sizeInBytes} bytes`;
+    if (sizeInBytes < 1024 * 1024) return `${(sizeInBytes / 1024).toFixed(1)} KB`;
+    return `${(sizeInBytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  // Format date in a readable way
+  const formatDate = (dateString: string): string => {
+    if (!dateString) return '';
+    try {
+      const date = new Date(dateString);
+      return date.toLocaleDateString('en-US', { 
+        year: 'numeric', 
+        month: 'short', 
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch (e) {
+      return dateString;
+    }
+  };
+
   return (
     <div className="container mx-auto p-4 bg-gray-900 min-h-screen">
       <h1 className="text-2xl font-bold mb-4 text-white">Google Drive Clone</h1>
 
-      {/* New Upload Section */}
+      {/* Upload Section */}
       <div className="mb-6 bg-gray-800 p-4 rounded-lg">
         <h2 className="text-lg font-semibold text-white mb-2">Upload Files</h2>
         <div className="flex flex-col space-y-4">
@@ -186,6 +291,76 @@ export default function GoogleDriveClone() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Uploaded Files Section */}
+      <div className="mb-6 bg-gray-800 p-4 rounded-lg">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-lg font-semibold text-white">Your Files</h2>
+          <Button 
+            variant="ghost" 
+            onClick={fetchUserFiles}
+            disabled={isLoadingFiles}
+            className="text-white border-gray-600 hover:bg-gray-700"
+          >
+            {isLoadingFiles ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+        
+        {isLoadingFiles ? (
+          <div className="flex justify-center p-8">
+            <Loader2 className="h-8 w-8 animate-spin text-blue-500" />
+          </div>
+        ) : uploadedFiles.length === 0 ? (
+          <p className="text-gray-400 text-center p-6">No files uploaded yet.</p>
+        ) : (
+          <div className="space-y-2">
+            {uploadedFiles.map((file) => (
+              <div 
+                key={file.id} 
+                className="p-4 border border-gray-700 rounded-lg flex items-center justify-between hover:bg-gray-800"
+              >
+                <div className="flex items-center">
+                  <File className="w-6 h-6 text-gray-400 mr-4" aria-label="File" />
+                  <div className="flex flex-col">
+                    <p className="text-sm text-white font-medium">{file.name}</p>
+                    <div className="flex items-center text-xs text-gray-400 mt-1">
+                      <span>{formatFileSize(file.size)}</span>
+                      <span className="mx-2">•</span>
+                      <span>{formatDate(file.uploadedAt)}</span>
+                    </div>
+                  </div>
+                </div>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" className="h-8 w-8 p-0">
+                      {isDeletingFile === file.id ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
+                      ) : (
+                        <MoreVertical className="h-4 w-4 text-gray-400" />
+                      )}
+                      <span className="sr-only">Open menu</span>
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-36">
+                    <DropdownMenuItem 
+                      className="text-red-500 focus:text-red-500 cursor-pointer"
+                      onClick={() => handleDeleteFile(file.id, file.name)}
+                      disabled={isDeletingFile === file.id}
+                    >
+                      <Trash2 className="mr-2 h-4 w-4" />
+                      Delete
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Query Section */}
