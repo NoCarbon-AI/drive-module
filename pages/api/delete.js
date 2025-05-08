@@ -39,97 +39,98 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Extract document details from request
-    const { documentId, fileName } = req.body;
+    const { documentId } = req.body;
+    const userId = req.headers['x-user-id'] || DEFAULT_USER_ID;
+
     if (!documentId) {
       return res.status(400).json({ error: 'Document ID is required' });
     }
 
-    // Get user ID from request header
-    let userId = req.headers['x-user-id'];
-    if (!userId) {
-      console.log('No user ID provided, using default user ID');
-      userId = DEFAULT_USER_ID;
-    }
-    console.log('Delete request for User ID:', userId, 'Document ID:', documentId);
+    console.log('Starting delete operation for document:', documentId);
 
-    // Step 1: Delete document metadata from Firestore
-    try {
-      await firestore.collection('users')
-        .doc(userId)
-        .collection('documents')
-        .doc(documentId)
-        .delete();
-      
-      console.log(`✅ Document metadata deleted from Firestore: userId=${userId}, documentId=${documentId}`);
-    } catch (e) {
-      console.error('Error deleting document from Firestore:', e);
-      return res.status(500).json({ 
-        error: 'Failed to delete document metadata from Firestore', 
-        details: e.message 
-      });
+    // First get the document metadata from Firestore
+    const docRef = firestore.collection('users')
+      .doc(userId)
+      .collection('documents')
+      .doc(documentId);
+
+    const docSnapshot = await docRef.get();
+    
+    if (!docSnapshot.exists) {
+      return res.status(404).json({ error: 'Document not found' });
     }
 
-    // Step 2: Delete file from GCP bucket if fileName is provided
-    if (fileName) {
-      try {
-        const file = bucket.file(fileName);
-        await file.delete();
-        console.log(`✅ File ${fileName} deleted from GCP bucket`);
-      } catch (e) {
-        console.error('Error deleting file from GCP bucket:', e);
-        // Continue with deletion process even if file deletion fails
-      }
-    }
+    const documentData = docSnapshot.data();
+    console.log('Found document metadata:', documentData);
 
-    // Step 3: Delete vectors from Qdrant
-    const collectionName = `user_${userId}_collection`;
-    try {
-      // Delete points with matching document_id from Qdrant collection
-      const deleteResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}/points/delete`, {
-        method: 'POST',
-        headers: {
-          'api-key': process.env.QDRANT_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          filter: {
-            must: [
-              {
-                key: "document_id",
-                match: {
-                  value: documentId
-                }
-              }
-            ]
+    // Delete from all sources in parallel
+    await Promise.all([
+      // 1. Delete from Firestore
+      docRef.delete().then(() => {
+        console.log('✅ Deleted from Firestore');
+      }).catch(e => {
+        console.error('Failed to delete from Firestore:', e);
+        throw e;
+      }),
+
+      // 2. Delete from Cloud Storage
+      (async () => {
+        const filePath = `${userId}/${documentId}/${documentData.document_name}`;
+        try {
+          await bucket.file(filePath).delete();
+          console.log('✅ Deleted from Cloud Storage:', filePath);
+        } catch (e) {
+          if (e.code !== 404) {
+            console.error('Failed to delete from Cloud Storage:', e);
+            throw e;
           }
-        }),
-      });
-      
-      const deleteResult = await deleteResponse.json();
-      console.log(`✅ Vector data deleted from Qdrant:`, deleteResult);
-      
-      if (!deleteResponse.ok) {
-        throw new Error(`Failed to delete from Qdrant: ${JSON.stringify(deleteResult)}`);
-      }
-    } catch (e) {
-      console.error('Error deleting vectors from Qdrant:', e);
-      return res.status(500).json({
-        error: 'Failed to delete vector data from Qdrant',
-        details: e.message
-      });
-    }
+        }
+      })(),
 
+      // 3. Delete from Qdrant
+      (async () => {
+        const collectionName = `user_${userId}_collection`;
+        const deleteResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}/points/delete`, {
+          method: 'POST',
+          headers: {
+            'api-key': process.env.QDRANT_API_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            filter: {
+              must: [
+                {
+                  key: "document_id",
+                  match: {
+                    value: documentId
+                  }
+                }
+              ]
+            }
+          }),
+        });
+
+        if (!deleteResponse.ok) {
+          const error = await deleteResponse.json();
+          console.error('Failed to delete from Qdrant:', error);
+          throw new Error(`Qdrant deletion failed: ${JSON.stringify(error)}`);
+        }
+        console.log('✅ Deleted from Qdrant');
+      })()
+    ]);
+
+    // Update the UI by removing the file from state
     return res.status(200).json({
-      message: 'Document deleted successfully',
+      message: 'Document deleted successfully from all sources',
       documentId,
       userId
     });
-  } catch (err) {
-    console.error('❌ Error during deletion:', err);
-    return res.status(500).json({ 
-      error: 'Failed to delete document',
-      details: err.message 
+
+  } catch (error) {
+    console.error('❌ Delete operation failed:', error);
+    return res.status(500).json({
+      error: 'Delete operation failed',
+      details: error.message
     });
   }
 }

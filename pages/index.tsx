@@ -22,7 +22,9 @@ interface UploadedFile {
 
 export default function GoogleDriveClone() {
   const [currentFolder, setCurrentFolder] = useState<Item[]>(mockData);
-  const [breadcrumbs, setBreadcrumbs] = useState<Item[]>([]);
+  const [breadcrumbs, setBreadcrumbs] = useState<Array<{ id: string, name: string }>>([]);
+  const [currentItems, setCurrentItems] = useState<Array<any>>([]);
+  const [currentFolderId, setCurrentFolderId] = useState<string | null>(null);
   const [status, setStatus] = useState<string>("");
   const [query, setQuery] = useState<string>("");
   const [response, setResponse] = useState<string>("");
@@ -33,43 +35,49 @@ export default function GoogleDriveClone() {
   const [isLoadingFiles, setIsLoadingFiles] = useState<boolean>(false);
   const [isDeletingFile, setIsDeletingFile] = useState<string | null>(null);
   const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null); // Track selected folder
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Fetch user's files on component mount
-  useEffect(() => {
-    fetchUserFiles();
-  }, []);
-
-  const fetchUserFiles = async () => {
+  // Update the fetchFolderContents function
+  const fetchFolderContents = async (folderId: string | null) => {
     setIsLoadingFiles(true);
     try {
-      // Get user ID from localStorage or use default
       const userId = localStorage.getItem("userId") || "default_user";
+      const url = `/api/files${folderId ? `?folderId=${folderId}` : ''}`;
       
-      const response = await fetch("/api/files", {
-        method: "GET",
-        headers: {
-          "x-user-id": userId
-        }
+      const response = await fetch(url, {
+        headers: { "x-user-id": userId }
       });
       
-      if (!response.ok) {
-        throw new Error("Failed to fetch files");
-      }
+      if (!response.ok) throw new Error("Failed to fetch folder contents");
       
       const data = await response.json();
-      setUploadedFiles(data.files || []);
+      
+      if (folderId) {
+        // Inside a folder - show only files
+        setCurrentItems(data.files || []);
+      } else {
+        // Root level - show both folders and files
+        const items = data.items || [];
+        setCurrentItems(items);
+        // Update uploadedFiles with folders for the folder selection section
+        setUploadedFiles(items.filter((item: UploadedFile) => item.type === "folder"));
+      }
     } catch (error) {
-      console.error("Error fetching files:", error);
+      console.error("Error fetching folder contents:", error);
     } finally {
       setIsLoadingFiles(false);
     }
   };
 
-  const handleDeleteFile = async (fileId: string, fileName: string) => {
+  // Fetch user's files on component mount
+  useEffect(() => {
+    fetchFolderContents(currentFolderId);
+  }, [currentFolderId]);
+
+  const handleDeleteFile = async (fileId: string) => {
     setIsDeletingFile(fileId);
     try {
-      // Get user ID from localStorage or use default
       const userId = localStorage.getItem("userId") || "default_user";
       
       const response = await fetch("/api/delete", {
@@ -78,23 +86,22 @@ export default function GoogleDriveClone() {
           "Content-Type": "application/json",
           "x-user-id": userId
         },
-        body: JSON.stringify({ 
-          documentId: fileId,
-          fileName: fileName
-        })
+        body: JSON.stringify({ documentId: fileId })
       });
-      
+
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.error || "Failed to delete file");
       }
+
+      // Remove file from both states
+      setCurrentItems(prev => prev.filter(item => item.id !== fileId));
+      setUploadedFiles(prev => prev.filter(file => file.id !== fileId));
       
-      // Remove file from state
-      setUploadedFiles(prevFiles => prevFiles.filter(file => file.id !== fileId));
-      // If the deleted file was selected, clear the selection
       if (selectedDocumentId === fileId) {
         setSelectedDocumentId(null);
       }
+
     } catch (error) {
       console.error("Error deleting file:", error);
       alert("Failed to delete file. Please try again.");
@@ -112,14 +119,21 @@ export default function GoogleDriveClone() {
     }
   };
 
-  const handleBreadcrumbClick = (index: number) => {
+  // Update handleFolderClick to properly handle navigation
+  const handleFolderClick = async (folder: any) => {
+    setCurrentFolderId(folder.id);
+    setBreadcrumbs(prev => [...prev, { id: folder.id, name: folder.name }]);
+    await fetchFolderContents(folder.id);
+  };
+
+  const handleBreadcrumbClick = async (index: number) => {
     if (index === -1) {
-      setCurrentFolder(mockData);
+      setCurrentFolderId(null);
       setBreadcrumbs([]);
     } else {
       const newBreadcrumbs = breadcrumbs.slice(0, index + 1);
-      setCurrentFolder(newBreadcrumbs[newBreadcrumbs.length - 1].children || []);
       setBreadcrumbs(newBreadcrumbs);
+      setCurrentFolderId(newBreadcrumbs[newBreadcrumbs.length - 1].id);
     }
   };
 
@@ -128,55 +142,90 @@ export default function GoogleDriveClone() {
     setSelectedDocumentId(fileId === selectedDocumentId ? null : fileId);
   };
 
+  // Function to create a new folder
+  const handleCreateFolder = async () => {
+    const folderName = prompt("Enter folder name:");
+    if (!folderName) return;
+
+    try {
+      const userId = localStorage.getItem("userId") || "default_user";
+      const response = await fetch("/api/folders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-user-id": userId,
+        },
+        body: JSON.stringify({ folderName }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to create folder");
+      }
+
+      fetchFolderContents(currentFolderId); // Refresh file list
+    } catch (error) {
+      console.error("Error creating folder:", error);
+      alert("Failed to create folder. Please try again.");
+    }
+  };
+
+  // Handle folder selection
+  const handleFolderSelect = (folderId: string) => {
+    setSelectedFolderId((prevFolderId) => (prevFolderId === folderId ? null : folderId));
+  };
+
   // Updated function to handle query submission
   const handleQuerySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!query.trim()) {
-      setResponse("Please enter a query.");
-      return;
+        setResponse("Please enter a query.");
+        return;
     }
 
     setIsLoading(true);
     setResponse("");
 
     try {
-      // Get user ID from localStorage or use default
-      const userId = localStorage.getItem("userId") || "default_user";
-      
-      // Prepare request body
-      const requestBody: any = { query, user_uuid: userId };
-      
-      // Find document name if a document is selected
-      if (selectedDocumentId) {
-        const selectedFile = uploadedFiles.find(file => file.id === selectedDocumentId);
-        if (selectedFile) {
-          requestBody.document_name = selectedFile.name;
+        const userId = localStorage.getItem("userId") || "default_user";
+        
+        // Prepare request body with updated structure
+        const requestBody: any = {
+            query,
+            user_uuid: userId,
+            search_params: {
+                user_id: userId
+            }
+        };
+        
+        // Add folder-specific or document-specific search parameters
+        if (selectedFolderId) {
+            requestBody.search_params.folder_id = selectedFolderId;
+        } else if (selectedDocumentId) {
+            requestBody.search_params.document_id = selectedDocumentId;
         }
-      }
-      
-      // Get the Cloud Run URL from environment variable or use a default
-      const cloudRunUrl = process.env.NEXT_PUBLIC_CLOUD_RUN_URL || "https://mcp-987835613654.us-east1.run.app";
-      
-      const res = await fetch(cloudRunUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      });
+        
+        const cloudRunUrl = process.env.NEXT_PUBLIC_CLOUD_RUN_URL || "https://mcp-987835613654.us-east1.run.app";
+        
+        const res = await fetch(cloudRunUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(requestBody),
+        });
 
-      if (!res.ok) {
-        const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to get response from server");
-      }
+        if (!res.ok) {
+            const errorData = await res.json();
+            throw new Error(errorData.error || "Failed to get response from server");
+        }
 
-      const data = await res.json();
-      setResponse(data.response || "No response received from server.");
+        const data = await res.json();
+        setResponse(data.response || "No response received from server.");
     } catch (error) {
-      console.error("Error:", error);
-      setResponse(`Error: ${error instanceof Error ? error.message : "Failed to fetch response from server."}`);
+        console.error("Error:", error);
+        setResponse(`Error: ${error instanceof Error ? error.message : "Failed to fetch response from server."}`);
     } finally {
-      setIsLoading(false);
+        setIsLoading(false);
     }
   };
 
@@ -194,20 +243,23 @@ export default function GoogleDriveClone() {
     handleFileUpload(file);
   };
 
-  // Handle actual file upload
+  // Update handleFileUpload function
   const handleFileUpload = async (file: File) => {
+    if (!selectedFolderId) {
+      alert("Please select a folder before uploading a file.");
+      return;
+    }
+
     setIsUploading(true);
     setUploadProgress(["Starting upload..."]);
 
     try {
-      // Create FormData
       const formData = new FormData();
       formData.append("file", file);
+      formData.append("folderId", selectedFolderId); // Add folder ID to form data
 
-      // Get user ID from localStorage or use a default
       const userId = localStorage.getItem("userId") || "default_user";
 
-      // Send the file to your API route
       const response = await fetch("/api/upload", {
         method: "POST",
         headers: {
@@ -217,21 +269,28 @@ export default function GoogleDriveClone() {
       });
 
       if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "Upload failed");
+        let errorMessage = "Upload failed";
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.error || errorMessage;
+        } catch (parseError) {
+          const errorText = await response.text();
+          errorMessage = errorText || `Upload failed with status ${response.status}`;
+        }
+        throw new Error(errorMessage);
       }
 
       const result = await response.json();
       
-      // Update progress with response data
       setUploadProgress([
         ...result.progress || [],
         `Document ID: ${result.documentId}`,
-        `User ID: ${result.userId}`
+        `User ID: ${result.userId}`,
+        `Folder ID: ${selectedFolderId}`
       ]);
 
-      // Refresh file list after successful upload
-      fetchUserFiles();
+      // Refresh the current folder contents
+      await fetchFolderContents(selectedFolderId);
       
       // Clear the file input
       if (fileInputRef.current) {
@@ -276,6 +335,56 @@ export default function GoogleDriveClone() {
   return (
     <div className="container mx-auto p-4 bg-gray-900 min-h-screen">
       <h1 className="text-2xl font-bold mb-4 text-white">Google Drive Clone</h1>
+
+      {/* Folder Creation Section */}
+      <div className="mb-6 bg-gray-800 p-4 rounded-lg">
+        <h2 className="text-lg font-semibold text-white mb-2">Manage Folders</h2>
+        <Button
+          onClick={handleCreateFolder}
+          className="bg-blue-600 text-white hover:bg-blue-700"
+        >
+          Create Folder
+        </Button>
+      </div>
+
+      {/* Folder Selection */}
+      <div className="mb-6 bg-gray-800 p-4 rounded-lg">
+        <h2 className="text-lg font-semibold text-white mb-2">Your Folders</h2>
+        <div className="space-y-2">
+          {uploadedFiles
+            .filter((file) => file.type === "folder")
+            .map((folder) => (
+              <div
+                key={folder.id}
+                className={`p-4 border rounded-lg flex items-center justify-between cursor-pointer ${
+                  selectedFolderId === folder.id
+                    ? "bg-blue-700 border-blue-500 text-white" // Highlight selected folder
+                    : "bg-gray-800 border-gray-700 text-gray-300" // Default style
+                }`}
+                onClick={() => handleFolderSelect(folder.id)}
+              >
+                <div className="flex items-center">
+                  <Folder className="w-6 h-6 mr-4" />
+                  <p className="text-sm">{folder.name}</p>
+                </div>
+                {selectedFolderId === folder.id && (
+                  <span className="text-xs text-blue-300">Selected</span>
+                )}
+              </div>
+            ))}
+        </div>
+
+        {selectedFolderId && (
+          <div className="mt-4 p-4 bg-gray-800 rounded-lg">
+            <p className="text-sm text-gray-300">
+              Selected Folder:{" "}
+              <span className="text-blue-400 font-semibold">
+                {uploadedFiles.find((folder) => folder.id === selectedFolderId)?.name}
+              </span>
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* Upload Section */}
       <div className="mb-6 bg-gray-800 p-4 rounded-lg">
@@ -324,10 +433,12 @@ export default function GoogleDriveClone() {
       {/* Uploaded Files Section */}
       <div className="mb-6 bg-gray-800 p-4 rounded-lg">
         <div className="flex justify-between items-center mb-4">
-          <h2 className="text-lg font-semibold text-white">Your Files</h2>
+          <h2 className="text-lg font-semibold text-white">
+            {currentFolderId ? `Contents of ${breadcrumbs[breadcrumbs.length - 1]?.name}` : 'Your Files'}
+          </h2>
           <Button 
             variant="ghost" 
-            onClick={fetchUserFiles}
+            onClick={() => fetchFolderContents(currentFolderId)}
             disabled={isLoadingFiles}
             className="text-white border-gray-600 hover:bg-gray-700"
           >
@@ -343,33 +454,43 @@ export default function GoogleDriveClone() {
           <div className="flex justify-center p-8">
             <Loader2 className="h-8 w-8 animate-spin text-blue-500" />
           </div>
-        ) : uploadedFiles.length === 0 ? (
-          <p className="text-gray-400 text-center p-6">No files uploaded yet.</p>
+        ) : currentItems.length === 0 ? (
+          <p className="text-gray-400 text-center p-6">
+            {currentFolderId ? 'This folder is empty' : 'No files or folders yet'}
+          </p>
         ) : (
           <div className="space-y-2">
-            {uploadedFiles.map((file) => (
+            {currentItems.map((item) => (
               <div 
-                key={file.id} 
+                key={item.id} 
                 className={`p-4 border border-gray-700 rounded-lg flex items-center justify-between hover:bg-gray-800 ${
-                  selectedDocumentId === file.id ? "bg-gray-700 border-blue-500" : ""
+                  selectedDocumentId === item.id ? "bg-gray-700 border-blue-500" : ""
                 }`}
-                onClick={() => handleFileSelect(file.id)}
+                onClick={() => handleFileSelect(item.id)}
               >
                 <div className="flex items-center">
-                  <File className={`w-6 h-6 ${selectedDocumentId === file.id ? "text-blue-500" : "text-gray-400"} mr-4`} aria-label="File" />
+                  {item.type === "folder" ? (
+                    <Folder className={`w-6 h-6 ${selectedFolderId === item.id ? "text-blue-500" : "text-gray-400"} mr-4`} />
+                  ) : (
+                    <File className={`w-6 h-6 ${selectedDocumentId === item.id ? "text-blue-500" : "text-gray-400"} mr-4`} />
+                  )}
                   <div className="flex flex-col">
-                    <p className="text-sm text-white font-medium">{file.name}</p>
-                    <div className="flex items-center text-xs text-gray-400 mt-1">
-                      <span>{formatFileSize(file.size)}</span>
-                      <span className="mx-2">•</span>
-                      <span>{formatDate(file.uploadedAt)}</span>
-                    </div>
+                    <p className="text-sm text-white font-medium">
+                      {item.name || item.document_name || "Untitled"} {/* Add fallback name */}
+                    </p>
+                    {item.type === "file" && (
+                      <div className="flex items-center text-xs text-gray-400 mt-1">
+                        <span>{formatFileSize(item.size)}</span>
+                        <span className="mx-2">•</span>
+                        <span>{formatDate(item.uploadedAt)}</span>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button variant="ghost" className="h-8 w-8 p-0" onClick={(e) => e.stopPropagation()}>
-                      {isDeletingFile === file.id ? (
+                      {isDeletingFile === item.id ? (
                         <Loader2 className="h-4 w-4 animate-spin text-gray-400" />
                       ) : (
                         <MoreVertical className="h-4 w-4 text-gray-400" />
@@ -382,9 +503,9 @@ export default function GoogleDriveClone() {
                       className="text-red-500 focus:text-red-500 cursor-pointer"
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleDeleteFile(file.id, file.name);
+                        handleDeleteFile(item.id);
                       }}
-                      disabled={isDeletingFile === file.id}
+                      disabled={isDeletingFile === item.id}
                     >
                       <Trash2 className="mr-2 h-4 w-4" />
                       Delete
@@ -400,16 +521,27 @@ export default function GoogleDriveClone() {
       {/* Query Section */}
       <div className="mb-6 bg-gray-800 p-4 rounded-lg">
         <h2 className="text-lg font-semibold text-white mb-2">Query Your Documents</h2>
-        {selectedDocumentId ? (
+        {selectedFolderId || selectedDocumentId ? (
           <div className="bg-blue-900/30 p-2 rounded-md mb-3 flex items-center">
-            <File className="text-blue-400 w-4 h-4 mr-2" />
-            <span className="text-sm text-blue-200">
-              Querying: {uploadedFiles.find(f => f.id === selectedDocumentId)?.name || "Selected document"}
-            </span>
+            {selectedFolderId ? (
+              <>
+                <Folder className="text-blue-400 w-4 h-4 mr-2" />
+                <span className="text-sm text-blue-200">
+                  Querying folder: {currentItems.find(f => f.id === selectedFolderId)?.name}
+                </span>
+              </>
+            ) : (
+              <>
+                <File className="text-blue-400 w-4 h-4 mr-2" />
+                <span className="text-sm text-blue-200">
+                  Querying file: {currentItems.find(f => f.id === selectedDocumentId)?.name}
+                </span>
+              </>
+            )}
           </div>
         ) : (
           <div className="bg-gray-700/50 p-2 rounded-md mb-3 text-sm text-gray-300">
-            Click on a file above to query it specifically, or submit a query without selecting to search all your documents.
+            Select a folder or file above to query it specifically, or submit a query to search all documents.
           </div>
         )}
         <form onSubmit={handleQuerySubmit} className="space-y-4">
@@ -444,7 +576,7 @@ export default function GoogleDriveClone() {
         </form>
       </div>
 
-      {/* Existing Breadcrumbs */}
+      {/* Breadcrumbs */}
       <div className="flex items-center mb-4 space-x-2">
         <Button
           variant="ghost"
@@ -467,23 +599,56 @@ export default function GoogleDriveClone() {
         ))}
       </div>
 
-      {/* Existing Folder/File List */}
+      {/* Files and Folders List */}
       <div className="space-y-2">
-        {currentFolder.length === 0 ? (
-          <p className="text-sm text-gray-400">This folder is empty</p>
+        {isLoadingFiles ? (
+          <div className="flex justify-center p-8">
+            <Loader2 className="h-8 w-8 animate-spin text-blue-500" />
+          </div>
+        ) : currentItems.length === 0 ? (
+          <p className="text-gray-400 text-center p-6">This folder is empty</p>
         ) : (
-          currentFolder.map((item) => (
+          currentItems.map((item) => (
             <div
               key={item.id}
-              className="p-4 border border-gray-700 rounded-lg cursor-pointer hover:bg-gray-800 flex items-center"
-              onClick={() => handleItemClick(item)}
+              className={`p-4 border border-gray-700 rounded-lg flex items-center justify-between hover:bg-gray-800 cursor-pointer ${
+                (selectedFolderId === item.id || selectedDocumentId === item.id)
+                  ? "bg-gray-700 border-blue-500"
+                  : ""
+              }`}
+              onClick={() => {
+                if (item.type === "folder") {
+                  if (item.id === selectedFolderId) {
+                    // If folder is already selected, navigate into it
+                    handleFolderClick(item);
+                  } else {
+                    // Otherwise, select the folder
+                    handleFolderSelect(item.id);
+                  }
+                } else {
+                  handleFileSelect(item.id);
+                }
+              }}
             >
-              {item.type === "folder" ? (
-                <Folder className="w-6 h-6 text-blue-500 mr-4" aria-label="Folder" />
-              ) : (
-                <File className="w-6 h-6 text-gray-400 mr-4" aria-label="File" />
-              )}
-              <p className="text-sm text-white">{item.name}</p>
+              <div className="flex items-center">
+                {item.type === "folder" ? (
+                  <Folder className={`w-6 h-6 ${selectedFolderId === item.id ? "text-blue-500" : "text-gray-400"} mr-4`} />
+                ) : (
+                  <File className={`w-6 h-6 ${selectedDocumentId === item.id ? "text-blue-500" : "text-gray-400"} mr-4`} />
+                )}
+                <div className="flex flex-col">
+                  <p className="text-sm text-white font-medium">
+                    {item.name || item.document_name || "Untitled"} {/* Add fallback name */}
+                  </p>
+                  {item.type === "file" && (
+                    <div className="flex items-center text-xs text-gray-400 mt-1">
+                      <span>{formatFileSize(item.size)}</span>
+                      <span className="mx-2">•</span>
+                      <span>{formatDate(item.uploadedAt)}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           ))
         )}

@@ -1,35 +1,29 @@
-"use strict"; // Ensure module behavior
+"use strict";
+
 import formidable from 'formidable';
 import fs from 'fs';
 import { Storage } from '@google-cloud/storage';
 import { UnstructuredClient } from 'unstructured-client';
 import { Strategy } from 'unstructured-client/sdk/models/shared';
-import { v4 as uuidv4 } from 'uuid'; // Add UUID package for generating unique IDs
+import { v4 as uuidv4 } from 'uuid';
+import pRetry from 'p-retry';
 
-// Default user ID to use as fallback
 const DEFAULT_USER_ID = "default_user";
 
-// Initialize Google Cloud Storage client
 const serviceAccountKey = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_KEY);
 const storage = new Storage({
   projectId: process.env.GCP_PROJECT_ID,
   credentials: serviceAccountKey
 });
 
-// Initialize Firestore
 let firestore;
 try {
   const { Firestore } = require('@google-cloud/firestore');
-  
-  // Create Firestore with explicit settings to avoid issues
   firestore = new Firestore({
     projectId: process.env.GCP_PROJECT_ID,
     credentials: serviceAccountKey,
-    ignoreUndefinedProperties: true, // Helps with potential undefined values
-    timestampsInSnapshots: true // Ensure timestamps are handled correctly
+    ignoreUndefinedProperties: true,
   });
-  
-  console.log('Firestore initialized successfully');
 } catch (e) {
   console.error('Error initializing Firestore:', e);
   throw new Error('Failed to initialize Firestore: ' + e.message);
@@ -38,26 +32,26 @@ try {
 const bucketName = process.env.GCP_BUCKET_NAME;
 const bucket = storage.bucket(bucketName);
 
+const GCP_EMBEDDING_ENDPOINT = process.env.GCP_ENDPOINT;
+
 let qdrantClient;
 try {
-  console.log('Attempting to load qdrant-client module...');
-  const qdrantModule = require('qdrant-client'); // qdrant-client supports CommonJS
-  console.log('qdrant-client module loaded:', Object.keys(qdrantModule));
-
-  if (!qdrantModule.HttpClient) {
-    console.error('HttpClient class not found in qdrant-client module');
-    throw new Error('HttpClient class not exported by qdrant-client');
-  }
-
-  const fetch = (await import('node-fetch')).default; // Dynamic ESM import for node-fetch
-  console.log('Initializing Qdrant HttpClient with URL:', process.env.QDRANT_URL);
-  qdrantClient = new qdrantModule.HttpClient({
-    url: process.env.QDRANT_URL,
-    apiKey: process.env.QDRANT_API_KEY,
-    timeout: 60,
-  });
-  console.log('Connected to Qdrant cluster successfully');
-  console.log('Qdrant client instance methods:', Object.keys(qdrantClient));
+  const fetchModule = await import('node-fetch');
+  const fetch = fetchModule.default;
+  qdrantClient = {
+    fetch: async (endpoint, method, body) => {
+      const url = `${process.env.QDRANT_URL}${endpoint}`;
+      const options = {
+        method: method,
+        headers: {
+          'api-key': process.env.QDRANT_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined
+      };
+      return fetch(url, options);
+    }
+  };
 } catch (e) {
   console.error('Qdrant client initialization error:', e.message || e);
   throw new Error('Failed to initialize Qdrant client: ' + (e.message || e));
@@ -69,12 +63,85 @@ export const config = {
   },
 };
 
+function estimateTokens(text) {
+  return Math.ceil(text.length / 3.5);
+}
+
+function chunkTextByTokenEstimate(text, maxTokens) {
+  const safeMaxTokens = Math.floor(maxTokens * 0.85);
+  const maxChars = Math.floor(safeMaxTokens * 3.5);
+  
+  if (estimateTokens(text) <= safeMaxTokens) {
+    return [text];
+  }
+  
+  const chunks = [];
+  let currentIdx = 0;
+  
+  while (currentIdx < text.length) {
+    let chunkEnd = currentIdx + maxChars;
+    let chunk = text.substring(currentIdx, chunkEnd);
+    
+    if (chunkEnd < text.length) {
+      const breakingPoints = [
+        chunk.lastIndexOf('. '),
+        chunk.lastIndexOf('? '),
+        chunk.lastIndexOf('! '),
+        chunk.lastIndexOf('\n'),
+        chunk.lastIndexOf('; '),
+        chunk.lastIndexOf(': '),
+        chunk.lastIndexOf(',')
+      ];
+      
+      const minBreakPos = Math.floor(maxChars * 0.5);
+      let breakPoint = -1;
+      
+      for (const point of breakingPoints) {
+        if (point > minBreakPos && (breakPoint === -1 || point > breakPoint)) {
+          breakPoint = point;
+        }
+      }
+      
+      if (breakPoint > 0) {
+        chunk = text.substring(currentIdx, currentIdx + breakPoint + 1);
+        currentIdx += breakPoint + 1;
+      } else {
+        const lastSpace = chunk.lastIndexOf(' ');
+        if (lastSpace > minBreakPos) {
+          chunk = text.substring(currentIdx, currentIdx + lastSpace);
+          currentIdx += lastSpace + 1;
+        } else {
+          currentIdx += maxChars;
+        }
+      }
+    } else {
+      currentIdx = text.length;
+    }
+    
+    const trimmedChunk = chunk.trim();
+    
+    if (trimmedChunk && estimateTokens(trimmedChunk) <= maxTokens) {
+      chunks.push(trimmedChunk);
+    } else if (trimmedChunk) {
+      const subChunks = chunkTextByTokenEstimate(trimmedChunk, maxTokens);
+      chunks.push(...subChunks);
+    }
+  }
+  
+  return chunks;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const form = formidable({ multiples: false });
+  const form = formidable({
+    multiples: false,
+    keepExtensions: true,
+    hashAlgorithm: false,
+  });
+
   let tempFilePath;
   let progress = [];
   let gcsFile;
@@ -94,307 +161,189 @@ export default async function handler(req, res) {
     }
     tempFilePath = file.filepath;
 
-    // Get the user ID from the request headers or use default if not provided
-    let userId = req.headers['x-user-id'];
-    if (!userId) {
-      console.log('No user ID provided, using default user ID');
-      userId = DEFAULT_USER_ID;
-    }
-    console.log('User ID:', userId);
-
-    // Generate a document ID (separate for each document)
+    let userId = req.headers['x-user-id'] || DEFAULT_USER_ID;
     const documentId = uuidv4();
-    console.log('Document ID:', documentId);
-
-    // Step 1: Upload to GCP bucket
-    inputFileName = file.originalFilename;
-    gcsFile = bucket.file(inputFileName);
+    inputFileName = file.originalFilename || `upload-${documentId}`;
+    gcsFile = bucket.file(`${userId}/${documentId}/${inputFileName}`);
 
     const fileContent = await fs.promises.readFile(tempFilePath);
     await gcsFile.save(fileContent);
-    const inputUrl = `https://storage.googleapis.com/${bucketName}/${inputFileName}`;
-    console.log('✅ Uploaded to GCP bucket:', inputUrl);
     progress.push('Uploaded to GCP bucket');
 
-    // Step 2: Process with Unstructured
     const serverUrl = process.env.UNSTRUCTURED_API_URL;
-    const apiKey = process.env.UNSTRUCTURED_API_KEY;
-    if (!apiKey) {
+    const unstructuredApiKey = process.env.UNSTRUCTURED_API_KEY;
+    if (!unstructuredApiKey) {
       throw new Error('UNSTRUCTURED_API_KEY is not set in .env');
     }
-    console.log('Initializing UnstructuredClient with serverURL:', serverUrl);
 
-    const client = new UnstructuredClient({
-      security: { apiKeyAuth: apiKey },
+    const unstructuredClient = new UnstructuredClient({
+      security: { apiKeyAuth: unstructuredApiKey },
       serverURL: serverUrl,
       retryConfig: {
         strategy: 'backoff',
         retryConnectionErrors: true,
-        backoff: {
-          initialInterval: 1000,
-          maxInterval: 60000,
-          exponent: 1.5,
-          maxElapsedTime: 1200000,
-        },
+        backoff: { initialInterval: 1000, maxInterval: 60000, exponent: 1.5, maxElapsedTime: 1200000 },
         maxRetries: 3,
       },
     });
 
-    const data = await fs.promises.readFile(tempFilePath);
-    console.log('Sending file to Unstructured:', inputFileName);
-    progress.push('Creating paging');
+    progress.push('Processing document with Unstructured');
 
-    const partitionResponse = await client.general.partition({
+    const partitionResponse = await unstructuredClient.general.partition({
       partitionParameters: {
-        files: {
-          content: data,
-          fileName: inputFileName,
-        },
+        files: { content: fileContent, fileName: inputFileName },
         strategy: Strategy.HiRes,
         splitPdfPage: true,
-        splitPdfAllowFailed: true,
-        splitPdfConcurrencyLevel: 15,
         languages: ['eng'],
+        chunkingStrategy: "by_title",
+        combineUnderNChars: 150,
+        newAfterNChars: 600,
+        maxCharacters: 800
       },
     }).catch((e) => {
-      console.error('Partition Error:', e);
-      if (e.statusCode) {
-        console.error('Status Code:', e.statusCode);
-        console.error('Body:', e.body);
-      } else {
-        console.error('Raw Error:', e);
+      console.error('Unstructured Partition Error:', e);
+      if (e.statusCode && e.body) {
+        throw new Error(`Unstructured Partition failed with status ${e.statusCode}: ${JSON.stringify(e.body)}`);
       }
-      throw e;
+      throw new Error(`Unstructured Partition failed: ${e.message || e}`);
     });
 
-    console.log('Raw Partition Response:', JSON.stringify(partitionResponse, null, 2));
-    let elements = [];
-    let statusCode = 200;
-    if (Array.isArray(partitionResponse)) {
-      elements = partitionResponse;
-    } else if (partitionResponse && typeof partitionResponse === 'object' && 'elements' in partitionResponse) {
-      elements = partitionResponse.elements || [];
-      statusCode = partitionResponse.statusCode || 200;
-    } else {
-      throw new Error('Unexpected partition response format');
+    let elements = (partitionResponse?.elements && Array.isArray(partitionResponse.elements)) ? partitionResponse.elements : (Array.isArray(partitionResponse) ? partitionResponse : []);
+    if (elements.length === 0) {
+      console.warn('No elements returned from Unstructured.');
     }
 
-    if (statusCode !== 200) {
-      throw new Error(`Partition failed with status ${statusCode}: ${JSON.stringify(elements)}`);
+    progress.push('Generating embeddings with GCP Embedding API');
+    const texts = elements.map(e => e.text || '').filter(text => text.trim() !== '');
+    if (texts.length === 0) {
+      console.warn('No valid text elements for embedding.');
     }
 
-    // Step 3: Generate Embeddings with Hugging Face Inference API
-    progress.push('Generating embeddings');
-    const texts = elements.map(e => e.text || '');
-    const embeddings = await generateEmbeddingsWithHuggingFace(texts);
-    console.log('Embeddings generated:', embeddings.length, 'vectors');
+    const processedTexts = [];
+    const elementMetadata = [];
+    const elementTypes = [];
+    const MAX_TOKENS_PER_CHUNK = 150;
+    
+    texts.forEach((text, index) => {
+      const chunks = chunkTextByTokenEstimate(text, MAX_TOKENS_PER_CHUNK);
+      chunks.forEach(chunk => {
+        const tokenCount = estimateTokens(chunk);
+        if (tokenCount > MAX_TOKENS_PER_CHUNK) {
+          console.warn(`Chunk exceeds token limit: ${tokenCount} tokens. Skipping.`);
+          return;
+        }
+        processedTexts.push(chunk);
+        elementMetadata.push(elements[index]?.metadata || {});
+        elementTypes.push(elements[index]?.type || 'unknown');
+      });
+    });
 
-    // Step 4: Store in Qdrant
-    const qdrant = qdrantClient;
-    const collectionName = `user_${userId}_collection`;
-    progress.push('Storing in Qdrant');
+    let embeddings = [];
+    if (processedTexts.length > 0) {
+      embeddings = await generateEmbeddingsWithGCP(processedTexts);
+    }
 
-    // Check if collection exists, create if needed
+    const collectionName = `user_${userId}_collection`.toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    progress.push('Preparing to store in Qdrant');
+
     try {
-      let collectionsResponse;
-      try {
-        collectionsResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}`, {
-          method: 'GET',
-          headers: {
-            'api-key': process.env.QDRANT_API_KEY,
-            'Content-Type': 'application/json',
-          },
-        });
-        console.log('Collection check response status:', collectionsResponse.status);
-      } catch (e) {
-        console.log('Collection check failed, assuming it doesn\'t exist:', e.message);
-      }
-
-      if (!collectionsResponse || collectionsResponse.status !== 200) {
-        console.log('Creating new collection:', collectionName);
-        const createResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}`, {
-          method: 'PUT',
-          headers: {
-            'api-key': process.env.QDRANT_API_KEY,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            vectors: {
-              size: 384,  // all-MiniLM-L6-v2 produces 384-dimensional vectors
-              distance: 'Cosine',
-            },
-          }),
+      let collectionsResponse = await qdrantClient.fetch(`/collections/${collectionName}`, 'GET');
+      if (collectionsResponse.status !== 200) {
+        const createResponse = await qdrantClient.fetch(`/collections/${collectionName}`, 'PUT', {
+          vectors: { size: 384, distance: 'Cosine' },
         });
         const createResult = await createResponse.json();
-        console.log('Create collection response:', createResult);
-        if (!createResponse.ok) {
-          throw new Error(`Failed to create collection: ${createResult.status || createResult.message}`);
-        }
+        if (!createResponse.ok) throw new Error(`Failed to create collection: ${JSON.stringify(createResult.status || createResult.message)}`);
       } else {
-        console.log('Collection already exists:', collectionName);
-        
-        // Delete any previous data with the same file name to prevent duplicates
-        try {
-          console.log(`Checking for existing points with file_name: ${inputFileName}`);
-          const searchResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}/points/scroll`, {
-            method: 'POST',
-            headers: {
-              'api-key': process.env.QDRANT_API_KEY,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              filter: {
-                must: [
-                  {
-                    key: "file_name",
-                    match: {
-                      value: inputFileName
-                    }
-                  }
-                ]
-              },
-              limit: 1000
-            }),
-          });
-          
-          const searchResult = await searchResponse.json();
-          if (searchResponse.ok && searchResult.points && searchResult.points.length > 0) {
-            console.log(`Found ${searchResult.points.length} existing points for file ${inputFileName}`);
-            
-            // Extract point IDs for deletion
-            const pointIdsToDelete = searchResult.points.map(point => point.id);
-            
-            // Delete points
-            if (pointIdsToDelete.length > 0) {
-              const deleteResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}/points/delete`, {
-                method: 'POST',
-                headers: {
-                  'api-key': process.env.QDRANT_API_KEY,
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  points: pointIdsToDelete
-                }),
-              });
-              
-              const deleteResult = await deleteResponse.json();
-              console.log(`Deleted ${pointIdsToDelete.length} existing points:`, deleteResult);
-            }
-          }
-        } catch (e) {
-          console.error('Error checking for existing points:', e);
-          // Continue with upload anyway
+        const deleteFilter = { filter: { must: [{ key: "document_id", match: { value: documentId } }] } };
+        const deletePointsResponse = await qdrantClient.fetch(`/collections/${collectionName}/points/delete`, 'POST', deleteFilter);
+        if (!deletePointsResponse.ok) {
+          console.warn(`Failed to delete existing points for document ${documentId}: Status ${deletePointsResponse.status}`);
         }
       }
     } catch (e) {
-      console.error('Collection creation/check error:', e);
+      console.error('Qdrant collection management error:', e);
       throw new Error('Failed to manage Qdrant collection: ' + (e.message || e));
     }
 
-    // Prepare points for Qdrant with document ID
-    const points = elements.map((element, index) => ({
-      id: uuidv4(), // Use a new UUID for each point
-      vector: embeddings[index],
-      payload: {
-        text: element.text || '',
-        metadata: element.metadata || {},
-        element_type: element.type || 'unknown',
-        document_id: documentId,
-        user_id: userId,
-        file_name: inputFileName,
-        document_name: inputFileName, // Explicitly store document_name in payload
-        created_at: new Date().toISOString()
-      },
-    }));
-    console.log('Points to upload:', points.slice(0, 2));
-
-    // Batch upload points via REST API
-    const batchSize = 10;
-    for (let i = 0; i < points.length; i += batchSize) {
-      const batch = points.slice(i, i + batchSize);
-      try {
-        const uploadResponse = await fetch(`${process.env.QDRANT_URL}/collections/${collectionName}/points`, {
-          method: 'PUT',
-          headers: {
-            'api-key': process.env.QDRANT_API_KEY,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            points: batch,
-          }),
-        });
-        const uploadResult = await uploadResponse.json();
-        console.log(`Uploaded batch ${i / batchSize + 1}/${Math.ceil(points.length / batchSize)}:`, uploadResult);
-        if (!uploadResponse.ok) {
-          console.error('Upload error details:', uploadResult);
-          throw new Error(`Failed to upload batch: ${uploadResult.status?.error || uploadResult.message || 'Unknown error'}`);
+    if (embeddings.length > 0 && processedTexts.length === embeddings.length) {
+      const points = processedTexts.map((text, index) => {
+        if (!embeddings[index] || embeddings[index].length !== 384) {
+          console.warn(`Invalid embedding at index ${index}. Skipping.`);
+          return null;
         }
-      } catch (e) {
-        console.error(`Error uploading batch ${i / batchSize + 1}:`, e);
-        throw new Error('Failed to upload points to Qdrant: ' + (e.message || e));
+        return {
+          id: uuidv4(),
+          vector: embeddings[index],
+          payload: {
+            text: text,
+            metadata: elementMetadata[index] || {},
+            element_type: elementTypes[index] || 'unknown',
+            document_id: documentId,
+            user_id: userId,
+            file_name: inputFileName,
+            folder_id: fields.folderId || null,
+            created_at: new Date().toISOString()
+          },
+        };
+      }).filter(point => point !== null);
+
+      if (points.length > 0) {
+        const batchSize = 100;
+        for (let i = 0; i < points.length; i += batchSize) {
+          const batch = points.slice(i, i + batchSize);
+          try {
+            const uploadResponse = await qdrantClient.fetch(`/collections/${collectionName}/points?wait=true`, 'PUT', { points: batch });
+            const uploadResult = await uploadResponse.json();
+            if (!uploadResponse.ok || uploadResult.status?.error) {
+              console.error('Qdrant upload error:', uploadResult);
+              throw new Error(`Failed to upload batch to Qdrant: ${uploadResult.status?.error || 'Unknown Qdrant error'}`);
+            }
+          } catch (e) {
+            console.error(`Error uploading Qdrant batch ${Math.floor(i / batchSize) + 1}:`, e);
+            throw new Error('Failed to upload points to Qdrant: ' + (e.message || e));
+          }
+        }
+        progress.push('Stored in Qdrant');
+      } else {
+        progress.push('No valid points to upload to Qdrant.');
       }
+    } else if (processedTexts.length > 0 && embeddings.length !== processedTexts.length) {
+      console.error('Mismatch between texts and embeddings. Skipping Qdrant upload.');
+      progress.push('Error: Text/embedding mismatch, Qdrant upload skipped.');
+    } else {
+      progress.push('No embeddings to store in Qdrant.');
     }
-    console.log('Vectors stored in Qdrant collection:', collectionName);
-    
-    // Step 5: Store document metadata in Firestore
-// Step 5: Store document metadata in Firestore
-try {
-  progress.push('Storing document metadata in Firestore');
-  
-  // Ensure all numbers are JavaScript numbers, not Long
-  const safeFileSize = Number(file.size) || 0;
 
-  // Create document data with only string and number types (no Date objects)
-  const documentData = {
-    document_id: documentId,
-    document_name: inputFileName,
-    file_size: safeFileSize, // Explicitly convert to Number
-    uploaded_timestamp: new Date().toISOString(), // Store as ISO string
-    mime_type: file.mimetype || 'application/octet-stream'
-  };
-  
-  // Store the document in Firestore under the hierarchical structure: users/{user_id}/documents/{document_id}
-  await firestore.collection('users')
-    .doc(userId)
-    .collection('documents')
-    .doc(documentId)
-    .set(documentData, { merge: true }); // Use merge to avoid overwriting
-  
-  console.log(`✅ Document metadata stored in Firestore: userId=${userId}, documentId=${documentId}`);
-  console.log('Document data stored:', documentData);
-} catch (e) {
-  console.error('Error storing document metadata in Firestore:', e);
-  console.error('Error details:', e.message);
-  console.error('Error stack:', e.stack);
-  progress.push('Warning: Failed to store document metadata in Firestore');
-  // Continue with success response anyway, as the main processing succeeded
-}
+    try {
+      progress.push('Storing document metadata in Firestore');
+      const safeFileSize = Number(file.size) || 0;
+      const documentData = {
+        document_id: documentId, document_name: inputFileName, file_size: safeFileSize,
+        uploaded_timestamp: new Date().toISOString(), mime_type: file.mimetype || 'application/octet-stream',
+        gcs_path: gcsFile.name, user_id: userId, status: 'processed',
+        chunk_count: processedTexts.length,
+        vector_count: embeddings.filter(e => e !== null).length,
+        qdrant_collection_name: collectionName
+      };
+      await firestore.collection('users').doc(userId).collection('documents').doc(documentId).set(documentData, { merge: true });
+    } catch (e) {
+      console.error('Error storing document metadata in Firestore:', e.message);
+      progress.push('Warning: Failed to store document metadata in Firestore');
+    }
 
-    // Final success message
     progress.push('File processed successfully');
     return res.status(200).json({
       message: 'Upload, processing, and vector storage successful',
-      progress,
-      collectionName,
-      project: process.env.GCP_PROJECT_ID,
-      documentId,
-      userId,
-      documentName: inputFileName
+      progress, collectionName, documentId, userId, documentName: inputFileName
     });
+
   } catch (err) {
-    console.error('❌ Error:', err.message || err);
+    console.error('Main Handler Error:', err.message || err);
     progress.push(`Error: ${err.message || 'Failed to process upload'}`);
-    
-    // If there was an error, try to clean up the GCP bucket file if it was created
     if (gcsFile) {
-      try {
-        await gcsFile.delete();
-        console.log(`✅ Cleaned up file ${inputFileName} from GCP bucket after error`);
-      } catch (cleanupErr) {
-        console.error('Failed to clean up GCP file after error:', cleanupErr);
-      }
+      try { await gcsFile.delete(); } catch (cleanupErr) { console.error('Failed to clean up GCS file:', cleanupErr); }
     }
-    
     return res.status(500).json({ error: err.message || 'Failed to process upload', progress });
   } finally {
     if (tempFilePath) {
@@ -403,29 +352,99 @@ try {
   }
 }
 
-// Function to generate embeddings using Hugging Face Inference API
-async function generateEmbeddingsWithHuggingFace(texts) {
-  const apiKey = process.env.HUGGINGFACE_API_KEY;
-  if (!apiKey) {
-    throw new Error('HUGGINGFACE_API_KEY is not set in .env');
+async function generateEmbeddingsWithGCP(texts) {
+  const allEmbeddings = [];
+  try {
+    const fetchModule = await import('node-fetch');
+    const fetch = fetchModule.default;
+    const { GoogleAuth } = require('google-auth-library');
+    const auth = new GoogleAuth({
+      credentials: serviceAccountKey,
+      scopes: ['https://www.googleapis.com/auth/cloud-platform']
+    });
+    const gcpClient = await auth.getClient();
+    const authToken = (await gcpClient.getAccessToken()).token;
+
+    if (!authToken) throw new Error('Failed to obtain access token for GCP');
+
+    const BATCH_SIZE = 8;
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const textBatch = texts.slice(i, i + BATCH_SIZE);
+      const instances = textBatch.map(textToEmbed => ({
+        inputs: textToEmbed 
+      }));
+      const payload = { instances };
+
+      const retryOptions = {
+        retries: 3,
+        onFailedAttempt: error => {
+          console.warn(`Embedding API attempt ${error.attemptNumber} failed for batch starting at index ${i}. ${error.retriesLeft} retries left. Error: ${error.message}`);
+        }
+      };
+
+      const result = await pRetry(async () => {
+        const response = await fetch(GCP_EMBEDDING_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${authToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errorBody = await response.text();
+          console.error(`GCP Embedding API Error (Status ${response.status}) for batch starting at index ${i}:`, errorBody);
+          const err = new Error(`GCP Embedding API error: ${response.status} - ${errorBody}`);
+          err.statusCode = response.status;
+          throw err; 
+        }
+        return await response.json();
+      }, retryOptions);
+
+      if (result.predictions && Array.isArray(result.predictions)) {
+        result.predictions.forEach((prediction, batchIndex) => {
+          if (prediction.embeddings && Array.isArray(prediction.embeddings.values) && prediction.embeddings.values.length === 384) {
+            allEmbeddings.push(prediction.embeddings.values);
+          } else if (Array.isArray(prediction.embedding) && prediction.embedding.length === 384) {
+            allEmbeddings.push(prediction.embedding);
+          } else if (Array.isArray(prediction) && prediction.length > 0 && Array.isArray(prediction[0]) && prediction[0].length === 384 && prediction[0].every(num => typeof num === 'number')) {
+            allEmbeddings.push(prediction[0]); 
+          } else if (Array.isArray(prediction) && prediction.length === 384 && prediction.every(num => typeof num === 'number')) {
+            allEmbeddings.push(prediction);
+          } else {
+            console.error(`Invalid prediction structure at index ${i + batchIndex}.`);
+            allEmbeddings.push(null); 
+          }
+        });
+      } else {
+        console.error(`No valid predictions for batch starting at index ${i}.`);
+        textBatch.forEach(() => allEmbeddings.push(null));
+      }
+    }
+    return allEmbeddings.filter(emb => emb !== null && emb.length === 384);
+  } catch (error) {
+    console.error('Error in generateEmbeddingsWithGCP:', error.message);
+    throw error;
   }
-  const apiUrl = process.env.HUGGINGFACE_API_URL || 'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2';
+}
 
-  const response = await fetch(apiUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ inputs: texts, options: { wait_for_model: true } }),
-  });
+async function handleFileUpload(file, userId, folderId) {
+  try {
+    const documentId = uuidv4();
+    const localFilePath = file.filepath;
+    const [fileUrl] = await bucket.upload(localFilePath, {
+      destination: `${userId}/${documentId}/${file.originalname}`
+    });
 
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(`Hugging Face API error: ${JSON.stringify(error)}`);
+    await generateAndStoreEmbeddings(/*...*/);
+
+    await bucket.file(`${userId}/${documentId}/${file.originalname}`).delete();
+
+    return {
+      success: true,
+      documentId,
+      progress: ['File processed successfully', 'Embeddings generated', 'Original file cleaned up']
+    };
+  } catch (error) {
+    console.error('Error in upload process:', error);
+    throw error;
   }
-
-  const data = await response.json();
-  // The API returns a list of embeddings, one per input text
-  return data;
 }
